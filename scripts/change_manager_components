@@ -1,0 +1,254 @@
+#! /usr/bin/env python
+import _ast
+import argparse
+import ast
+import os
+import socket
+import subprocess
+import sys
+
+
+def ip_address(value):
+    is_ip_address = False
+    try:
+        socket.inet_pton(socket.AF_INET, value)
+        is_ip_address = True
+    except socket.error:
+        # Not IPv4
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, value)
+        is_ip_address = True
+    except socket.error:
+        # Not IPv6
+        pass
+
+    if is_ip_address:
+        return value
+    else:
+        raise ValueError()
+
+
+def key_file(path):
+    if os.path.isfile(os.path.expanduser(path)):
+        return path
+    else:
+        raise ValueError()
+
+
+def repository_path(path):
+    check_path = os.path.expanduser(path)
+    setup_path = os.path.join(check_path, 'setup.py')
+    if os.path.isdir(check_path) and os.path.isfile(setup_path):
+        # All good
+        pass
+    else:
+        raise argparse.ArgumentTypeError(
+            "invalid repository_path value: '{path}'. Specified path "
+            "must contain a setup.py at '{setup_path}'.".format(
+                path=path,
+                setup_path=setup_path,
+            )
+        )
+    return path
+
+
+def find_package_name(setup_file):
+    # Investigate the setup.py file
+    tree = ast.walk(compile(setup_file, "code", "exec", ast.PyCF_ONLY_AST))
+    for node in tree:
+        # Find the call to 'setup'
+        if isinstance(node, _ast.Call) and node.func.id == 'setup':
+            # Look through the keyword arguments
+            # If you're not using keywords... I can't help you.
+            for kw in node.keywords:
+                # Is this the 'name' argument?
+                if kw.arg == 'name':
+                    # Strings store their value under '.s' in ast
+                    return kw.value.s
+    raise ValueError(
+        'Could not find name setting in setup file: """{contents}"""'.format(
+            contents=setup_file
+        )
+    )
+
+
+def main(args):
+    parser = argparse.ArgumentParser()
+
+    parser.description = (
+        'Utility script to update manager code based on local modified '
+        'repositories.'
+    )
+    parser.epilog = (
+        ' Example: {} --manager-ip 192.0.2.4 --repository '
+        'cloudify-manager/rest-service'.format(sys.argv[0])
+    )
+
+    parser.add_argument(
+        '--ssh-user', '-u',
+        help="username to use when SSHing to manager",
+        default='cloudify',
+        type=str,
+    )
+    parser.add_argument(
+        '--ssh-key-path', '-k',
+        help="private key to use when SSHing to manager",
+        default='~/.ssh/id_rsa',
+        type=key_file,
+    )
+    parser.add_argument(
+        '--manager-ip', '-i',
+        help="IP address to use when SSHing to manager",
+        type=ip_address,
+        required=True,
+    )
+    parser.add_argument(
+        '--repository', '-r',
+        help=(
+            "location(s) of code repositories to be used to update manager. "
+            "Each path must be a directory containing a setup.py. "
+            "They will be used to replace existing versions under any envs "
+            "under /opt on the manager"
+        ),
+        type=repository_path,
+        nargs='+',
+        required=True,
+    )
+
+    args = parser.parse_args()
+
+    cloudify_services_stop_order = [
+        'cloudify-webui.service',
+        'cloudify-restservice.service',
+        'cloudify-riemann.service',
+        'cloudify-mgmtworker.service',
+        'cloudify-amqpinflux.service',
+        'logstash.service',
+        'nginx.service',
+        'cloudify-rabbitmq.service',
+        'cloudify-influxdb.service',
+        'elasticsearch.service'
+    ]
+    cloudify_services_start_order = reversed(cloudify_services_stop_order)
+
+    print("Stopping services to modify manager.")
+    for service in cloudify_services_stop_order:
+        print("Stopping service on manager: {}".format(service))
+        try:
+            run_ssh_command(
+                ssh_args=args,
+                command=['sudo', 'systemctl', 'stop', service],
+            )
+        except subprocess.CalledProcessError as err:
+            if (
+                err.returncode == 143 and
+                service == 'cloudify-rabbitmq.service',
+            ):
+                pass
+            else:
+                raise
+
+    print("Finding pips under /opt on manager")
+    pips = run_ssh_command(
+        ssh_args=args,
+        command=[
+            # Find all pips in the virtualenvs under /opt
+            # (note: won't just look for virtualenvs but given the current
+            # structure of /opt it effectively will)
+            # sudo needed to avoid error from influxdb permissions
+            'sudo find /opt -type f -name pip'
+        ],
+    ).split()
+    print("Pips found: {}".format(pips))
+
+    print("Preparing to upload your packages...")
+    # Now, upload the new code and install it
+    for path in args.repository:
+        print("  Processing {}".format(path))
+        # Look up name of package
+        with open(os.path.join(path, 'setup.py')) as setup_handle:
+            setup = setup_handle.read()
+        package_name = find_package_name(setup)
+        print("  Package is called {}".format(package_name))
+
+        zip_name = package_name + '.zip'
+
+        print("  Creating zip file of package")
+        zip_cwd, zip_path = os.path.split(path)
+        subprocess.check_output(
+            ['zip', '-r', '/tmp/' + zip_name, zip_path],
+            cwd=zip_cwd,
+            stderr=subprocess.STDOUT,
+        )
+
+        print("  Uploading zip file of package")
+        subprocess.check_output(
+            [
+                'scp',
+                '-i', args.ssh_key_path,
+                '/tmp/' + zip_name,
+                '{user}@{host}:/tmp'.format(
+                    user=args.ssh_user,
+                    host=args.manager_ip,
+                ),
+            ],
+            stderr=subprocess.STDOUT,
+        )
+
+        print("  Trying to replace package")
+        for pip in pips:
+            try:
+                run_ssh_command(
+                    ssh_args=args,
+                    command=['sudo', pip, 'uninstall', '-y', package_name],
+                )
+                print("  Removed {} with {}".format(package_name, pip))
+            except subprocess.CalledProcessError as err:
+                if 'not installed' in err.output:
+                    continue
+                else:
+                    raise
+            run_ssh_command(
+                ssh_args=args,
+                command=['sudo', pip, 'install', '/tmp/' + zip_name],
+            )
+            print("  Installed {} with {}".format(package_name, pip))
+
+        print("Removing package zip")
+        run_ssh_command(
+            ssh_args=args,
+            command=['rm', '/tmp/' + zip_name],
+        )
+        subprocess.check_output(
+            ['rm', '/tmp/' + zip_name],
+            stderr=subprocess.STDOUT,
+        )
+
+    print("Updates done, starting services")
+    for service in cloudify_services_start_order:
+        print("Starting service on manager: {}".format(service))
+        run_ssh_command(
+            ssh_args=args,
+            command=['sudo', 'systemctl', 'start', service],
+        )
+    print("Manager modified... good luck!")
+
+
+def run_ssh_command(ssh_args, command):
+    ssh_command = [
+        'ssh',
+        '-i', ssh_args.ssh_key_path,
+        '{user}@{host}'.format(
+            user=ssh_args.ssh_user,
+            host=ssh_args.manager_ip,
+        ),
+    ]
+    ssh_command.extend(command)
+    return subprocess.check_output(
+        ssh_command,
+        stderr=subprocess.STDOUT,
+    )
+
+if __name__ == '__main__':
+    main(sys.argv[1:])
